@@ -1,0 +1,179 @@
+const express = require("express");
+const http = require("http");
+const socketIo = require("socket.io");
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+const fs = require("fs");
+const multer = require("multer");
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: { origin: "*" },
+});
+
+app.use(cors());
+app.use(express.json());
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, "uploads/"),
+  filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
+});
+const upload = multer({ storage });
+app.use("/files", express.static(path.join(__dirname, "uploads")));
+
+app.post("/login", (req, res) => {
+  const { username } = req.body;
+  const token = jwt.sign({ username }, "secret", { expiresIn: "1h" });
+  res.json({ token });
+});
+
+app.post("/upload", upload.single("file"), (req, res) => {
+  res.json({ filePath: `/files/${req.file.filename}` });
+});
+
+io.on("connection", (socket) => {
+  socket.on("join-room", (roomId, userId) => {
+    socket.join(roomId);
+    socket.to(roomId).emit("user-connected", userId);
+
+    socket.on("disconnect", () => {
+      socket.to(roomId).emit("user-disconnected", userId);
+    });
+  });
+
+  socket.on("drawing", (data) => {
+    socket.broadcast.emit("drawing", data);
+  });
+
+  socket.on("send-file", (fileData) => {
+    socket.broadcast.emit("receive-file", fileData);
+  });
+
+  socket.on("screen-share", (data) => {
+    socket.broadcast.emit("screen-share", data);
+  });
+});
+
+server.listen(5000, () => console.log("Server started on port 5000"));
+
+
+import React, { useEffect, useRef, useState } from "react";
+import io from "socket.io-client";
+import Peer from "simple-peer";
+import Whiteboard from "./Whiteboard";
+import FileUploader from "./FileUploader";
+
+const socket = io("http://localhost:5000");
+
+const App = () => {
+  const [stream, setStream] = useState();
+  const [myId, setMyId] = useState("");
+  const userVideo = useRef();
+  const partnerVideo = useRef();
+  const peerRef = useRef();
+
+  useEffect(() => {
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then((stream) => {
+      setStream(stream);
+      if (userVideo.current) userVideo.current.srcObject = stream;
+    });
+
+    const id = Math.floor(Math.random() * 10000).toString();
+    setMyId(id);
+    socket.emit("join-room", "room1", id);
+
+    socket.on("user-connected", (userId) => {
+      const peer = new Peer({ initiator: true, trickle: false, stream });
+      peer.on("signal", (signal) => {
+        socket.emit("signal", { userToSignal: userId, signal, from: id });
+      });
+      peer.on("stream", (partnerStream) => {
+        if (partnerVideo.current) partnerVideo.current.srcObject = partnerStream;
+      });
+      peerRef.current = peer;
+    });
+  }, []);
+
+  return (
+    <div>
+      <h1>Real-Time Communication App</h1>
+      <video ref={userVideo} autoPlay muted width="300" />
+      <video ref={partnerVideo} autoPlay width="300" />
+      <Whiteboard socket={socket} />
+      <FileUploader />
+    </div>
+  );
+};
+
+export default App;
+
+import React, { useEffect, useRef } from "react";
+
+const Whiteboard = ({ socket }) => {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas.getContext("2d");
+    let drawing = false;
+
+    const draw = (x, y) => {
+      context.lineTo(x, y);
+      context.stroke();
+    };
+
+    canvas.addEventListener("mousedown", () => { drawing = true; context.beginPath(); });
+    canvas.addEventListener("mouseup", () => { drawing = false; });
+    canvas.addEventListener("mousemove", (e) => {
+      if (!drawing) return;
+      const x = e.clientX - canvas.offsetLeft;
+      const y = e.clientY - canvas.offsetTop;
+      draw(x, y);
+      socket.emit("drawing", { x, y });
+    });
+
+    socket.on("drawing", ({ x, y }) => draw(x, y));
+  }, [socket]);
+
+  return <canvas ref={canvasRef} width={600} height={400} style={{ border: "1px solid black" }} />;
+};
+
+export default Whiteboard
+
+import React, { useState } from "react";
+import axios from "axios";
+
+const FileUploader = () => {
+  const [file, setFile] = useState(null);
+  const [uploadedPath, setUploadedPath] = useState("");
+
+  const handleUpload = async () => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const res = await axios.post("http://localhost:5000/upload", formData);
+    setUploadedPath(res.data.filePath);
+  };
+
+  return (
+    <div>
+      <input type="file" onChange={(e) => setFile(e.target.files[0])} />
+      <button onClick={handleUpload}>Upload</button>
+      {uploadedPath && (
+        <div>
+          <p>File uploaded: <a href={`http://localhost:5000${uploadedPath}`} target="_blank">Download</a></p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default FileUploader;
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
